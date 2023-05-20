@@ -1,0 +1,7 @@
+server:
+  port: 8881 #服务端口
+spring:
+  application:
+    name: freemarker-demo #指定服务名
+  freemarker:
+    suffix: .ftl

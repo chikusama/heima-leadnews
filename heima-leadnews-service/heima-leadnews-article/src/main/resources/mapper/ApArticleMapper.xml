@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd" >
+<mapper namespace="com.heima.article.mapper.ApArticleMapper">
+    <select id="listLoadByType" resultType="com.heima.model.article.entity.ApArticle">
+        select ac.*
+        from ap_article ac
+        left join ap_article_config aac
+        on ac.id = aac.article_id
+        <where>
+            aac.is_delete = 0
+            and aac.is_down = 0
+            <if test="dto.tag != null and dto.tag != '__all__'">
+                and ac.channel_id = #{dto.tag}
+            </if>
+            <if test="loadtype != null and loadtype ==1">
+                and ac.publish_time &lt; #{dto.minBehotTime}
+            </if>
+            <if test="loadtype != null and loadtype ==2">
+                and ac.publish_time &gt; #{dto.maxBehotTime}
+            </if>
+
+        </where>
+        order by ac.publish_time desc
+        limit #{dto.size};
+
+
+    </select>
+</mapper>

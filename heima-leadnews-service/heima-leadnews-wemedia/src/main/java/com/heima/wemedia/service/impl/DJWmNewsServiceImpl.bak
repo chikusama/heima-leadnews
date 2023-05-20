@@ -1,0 +1,374 @@
+package com.heima.wemedia.service.impl;
+
+import com.alibaba.fastjson.JSONArray;
+import com.baomidou.mybatisplus.core.toolkit.Wrappers;
+import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
+import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
+import com.heima.api.article.IArticleClient;
+import com.heima.common.aliyun.GreenImageScan;
+import com.heima.common.aliyun.GreenTextScan;
+import com.heima.common.news.WmNewsCoverType;
+import com.heima.common.news.WmNewsStatus;
+import com.heima.file.service.FileStorageService;
+import com.heima.model.article.dtos.ArticleDto;
+import com.heima.model.common.dtos.PageResponseResult;
+import com.heima.model.common.dtos.ResponseResult;
+import com.heima.model.common.enums.AppHttpCodeEnum;
+import com.heima.model.wemedia.dtos.WmNewsDto;
+import com.heima.model.wemedia.dtos.WmNewsPageReqDto;
+import com.heima.model.wemedia.entity.WmChannel;
+import com.heima.model.wemedia.entity.WmMaterial;
+import com.heima.model.wemedia.entity.WmNews;
+import com.heima.model.wemedia.entity.WmNewsMaterial;
+import com.heima.utils.thread.WmThreadLocalUtil;
+import com.heima.wemedia.mapper.WmNewsMapper;
+import com.heima.wemedia.service.*;
+import org.apache.commons.lang.StringUtils;
+import org.springframework.beans.BeanUtils;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.stereotype.Service;
+
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.stream.Collectors;
+
+/**
+ * 自媒体图文内容信息表(WmNews)表服务实现类
+ *
+ * @author 董杰
+ * @since 2022-10-29 09:43:24
+ */
+@Service("wmNewsService")
+public class WmNewsServiceImpl extends ServiceImpl<WmNewsMapper, WmNews> implements WmNewsService {
+    @Autowired
+    WmNewsMaterialService newsMaterialService;
+    @Autowired
+    WmMaterialService materialService;
+    @Autowired
+    private FileStorageService fileStorageService;
+    @Autowired
+    private GreenImageScan greenImageScan;
+    @Autowired
+    private GreenTextScan greenTextScan;
+    @Autowired
+    private WmChannelService channelService;
+    @Autowired
+    private WmUserService userService;
+    @Autowired
+    private IArticleClient articleClient;
+
+    @Override
+    public PageResponseResult findPage(WmNewsPageReqDto wmNewsPageReqDto) {
+        //1.对分页参数进行校验
+        wmNewsPageReqDto.checkParam();
+        //1.分页查询
+        Page<WmNews> page = this.page(new Page<WmNews>(wmNewsPageReqDto.getPage(),wmNewsPageReqDto.getSize()),Wrappers.<WmNews>lambdaQuery()
+                .eq(wmNewsPageReqDto.getStatus() != null,WmNews::getStatus,wmNewsPageReqDto.getStatus())
+                .like(StringUtils.isNotEmpty(wmNewsPageReqDto.getKeyword()),WmNews::getTitle,wmNewsPageReqDto.getKeyword())
+                .eq(wmNewsPageReqDto.getChannelId() != null,WmNews::getChannelId,wmNewsPageReqDto.getChannelId())
+                .between(wmNewsPageReqDto.getBeginPubdate() != null && wmNewsPageReqDto.getEndPubdate() != null && wmNewsPageReqDto.getBeginPubdate().compareTo(wmNewsPageReqDto.getEndPubdate()) == -1,WmNews::getPublishTime,wmNewsPageReqDto.getBeginPubdate(),wmNewsPageReqDto.getEndPubdate())
+                .eq(WmThreadLocalUtil.getUser().getId() != null,WmNews::getUserId,WmThreadLocalUtil.getUser().getId()));
+        //2.封装查询结果
+        PageResponseResult pageResponseResult = new PageResponseResult(wmNewsPageReqDto.getPage(),wmNewsPageReqDto.getSize(),(int) page.getTotal());
+        ResponseResult responseResult = ResponseResult.okResult(page.getRecords());
+        BeanUtils.copyProperties(responseResult,pageResponseResult);
+        pageResponseResult.setHost("");
+        return pageResponseResult;
+
+    }
+
+    @Override
+    public ResponseResult submitNews(WmNewsDto newsDto) throws Exception {
+        Integer newsId = newsDto.getId();
+        WmNews news = new WmNews();
+        BeanUtils.copyProperties(newsDto,news);
+        //属性封装
+        news.setCreatedTime(new Date());
+        news.setUserId(WmThreadLocalUtil.getUser().getId());
+//----------------------------------------------------------
+        List<String> images = newsDto.getImages(); //封面图片
+        Short type = newsDto.getType(); //封面图片状态
+        //封面图片根据状态提取正文中的图片作为封面图片
+        List<Map> content = JSONArray.parseArray(newsDto.getContent(),Map.class); //将正文的内容提取成map存到list中
+        List<String> list = content.stream().filter(map -> { //获取图片集合
+            if (map.get("type").equals("image")) {
+                return true;
+            }
+
+            return false;
+        }).map(map ->
+                (String) map.get("value")
+        ).collect(Collectors.toList());
+        //根据状态设置图片字段
+        if (type == WmNewsCoverType.SYS_SUTO) { //自动填充
+            //判断正文中又几张图片
+            if (list.size() == 0) {
+                type = WmNewsCoverType.NO_PICTURE;
+            } else if (list.size() >= 1 && list.size() < 3) {
+                images = list.stream().limit(1).collect(Collectors.toList());
+                //设置状态
+                type = WmNewsCoverType.ONE_PICTURE;
+            } else if (list.size() >= 3) {
+                images = list.stream().limit(3).collect(Collectors.toList());
+                //设置状态
+                type = WmNewsCoverType.MORE_PICTURE;
+            }
+        }
+        news.setType(type);
+        news.setImages(String.join(",",images));
+        //1.根据id判断是新增还是修改
+        if (newsId == null) {
+            //新增操作
+            this.save(news);
+        } else {
+            //修改操作
+            //将中间表的数据删除
+            newsMaterialService.remove(Wrappers.<WmNewsMaterial>lambdaQuery()
+                    .eq(WmNewsMaterial::getNewsId,newsDto.getId()));
+            this.updateById(news);
+        }
+        //2.判断是否是草稿如果不是草稿,则需要向中间表插入数据
+        if (newsDto.getStatus() != WmNewsStatus.DRAFT) {
+            //表示不是草稿需要向中间表中插入数据
+            //将封面图片保存到中间表
+            saveBathNewsMaterials(news,images,0);
+            //将正文图片保存到中间表
+            saveBathNewsMaterials(news,list,1);
+
+
+        }
+        ResponseResult responseResult = ResponseResult.okResult("SUCCESS");
+        responseResult.setHost("");
+
+        //3.将用户发布的保存到article的各个表中
+        //进行校验数据校验
+        scanNews1(news);
+
+
+        //根据审核的结果将用户发布的信息保存到相对应的article表中
+
+        return responseResult;
+    }
+
+    private void saveBathNewsMaterials(WmNews news,List<String> imagesFrom,int type) {
+        if (imagesFrom.size()==0)
+            return;
+        //1.根据imagesFrom提供的图片地址,获取List<WmMaterial>
+        List<WmMaterial> materials = materialService
+                .list(Wrappers.<WmMaterial>lambdaQuery().in(WmMaterial::getUrl,imagesFrom));
+        //2.对List<WmMaterial>遍历获得List<WmNewsMaterial>
+        List<WmNewsMaterial> newsMaterials = materials.stream().map(material -> {
+            WmNewsMaterial newsMaterial = new WmNewsMaterial();
+            newsMaterial.setMaterialId(material.getId());
+            newsMaterial.setNewsId(news.getId());
+            newsMaterial.setType(type);
+            newsMaterial.setOrd(materials.indexOf(material));
+            return newsMaterial;
+
+        }).collect(Collectors.toList());
+        //3.批量插入
+        newsMaterialService.saveBatch(newsMaterials);
+    }
+
+
+    private void scanNews1(WmNews news) throws Exception {
+        //1.判断文章内容是不是提交
+        Object status = news.getStatus();
+        if (status == WmNewsStatus.SUBMIT) {
+            //获取文章对象中的数据
+            String newsContent = news.getContent();
+            String newsImages = news.getImages();
+            String title = news.getTitle();
+            //用来存储审核的文字数据
+            StringBuilder stringBuilder = new StringBuilder();
+            //用来存储图片的路径
+            ArrayList<String> imagesUrl = new ArrayList<>();
+            //将封面图片路径解析
+            if (StringUtils.isNotEmpty(newsImages)){
+                String[] split = newsImages.split(",");
+                //放入
+                imagesUrl.addAll(Arrays.asList(split));
+            }
+
+
+
+            stringBuilder.append(title);
+            //解析正文中的文字数据
+            List<Map> maps = JSONArray.parseArray(newsContent,Map.class);
+
+            maps.forEach(map -> {
+                if (map.get("type").equals("text")) {
+                    stringBuilder.append(map.get("value"));//文本数据
+                }
+                if (map.get("type").equals("image")) {
+                    imagesUrl.add(map.get("value")+"");
+                }
+
+            });
+            //将文本数据进行审核
+            Map textMap = greenTextScan.greeTextScan(stringBuilder.toString());
+            if (textMap!=null) {
+                if (scanSuggest(news,textMap)) return;
+            }
+            //根据图片的路径下载图片兵转换成二进制
+            ArrayList<byte[]> images = new ArrayList<>();
+            imagesUrl.stream().forEach(map -> {
+                byte[] loadFile = fileStorageService.downLoadFile(map);
+                images.add(loadFile);
+            });
+            //图片审核
+            Map imageMap = greenImageScan.imageScan(images);
+            if (imageMap!=null) {
+                if (scanSuggest(news,imageMap)) return;
+            }
+
+            //3.表示审核通过,调用openFeign完成远程调用服务保存相关的article表
+            ArticleDto articleDto = new ArticleDto();
+            BeanUtils.copyProperties(news,articleDto);
+            //设置作者
+            articleDto.setAuthorId(news.getUserId());
+            articleDto.setAuthorName(userService.getById(news.getUserId()).getNickname());
+            //设置频道名称
+            articleDto.setChannelName(channelService.getById(news.getChannelId()).getName());
+            //设置文章布局
+            articleDto.setLayout((int) news.getType());
+            //设置创建时间
+            articleDto.setCreatedTime(new Date());
+            if (news.getArticleId() != null) {
+                articleDto.setId(news.getArticleId());
+            }
+            //通过openFegin远程调用
+            ResponseResult responseResult = articleClient.saveArticle(articleDto);
+
+            if (responseResult.getCode() ==AppHttpCodeEnum.SUCCESS.getCode()) {
+                //如果审核成功：修改news中status=9 会写articleId
+                news.setArticleId((Long) responseResult.getData());
+                news.setStatus(WmNewsStatus.PUBLISHED);
+                //修改
+                this.updateById(news);
+            }
+        }
+    }
+
+
+    /**
+     * 在提交待审核时候会进行文本、图片审核
+     *
+     * @param news
+     */
+    private void scanNews(WmNews news) {
+        if (news.getStatus() == WmNewsStatus.SUBMIT) {
+            //0.将news文本=标题+正文文本； news图片url=正文图片url+封面图片url
+            //定义一个content拼接所有文本
+            StringBuilder textScan = new StringBuilder();
+            //定义一个集合用来封装所有图片地址
+            List<String> images = new ArrayList<>();
+
+            //解析news获取标题作为文本
+            textScan.append(news.getTitle());
+
+            //解析news获取封面图片
+            String imagesFromCover = news.getImages();
+            images.addAll(Arrays.asList(imagesFromCover.split(",")));
+
+            //解析news中正文获取文本和图片 [{"type":"text","value":"1234"},{"type":"image","value":"http://..."}]
+            String content = news.getContent();
+            List<Map> maps = JSONArray.parseArray(content,Map.class);
+            maps.forEach(map -> {
+                //提取文本
+                if (map.get("type").equals("text")) {
+                    textScan.append(map.get("value"));
+                }
+                //提取图片
+                if (map.get("type").equals("image")) {
+                    images.add((String) map.get("value"));
+                }
+            });
+            //针对图片地址需要进行去重
+            List<String> imagesScan = images.stream().distinct().collect(Collectors.toList());
+
+
+            //1.文本审核
+            try {
+                //文本审核结果解析： 例如{suggestion=block, label=contraband}  {suggestion=review,label=xx}
+                Map textMap = greenTextScan.greeTextScan(textScan.toString());
+                //审核失败
+                if (scanSuggest(news,textMap)) return;
+
+            } catch (Exception e) {
+                e.printStackTrace();
+            }
+
+
+            //2.图片审核 所有图片地址imagesScan
+            List<byte[]> list = new ArrayList<>();
+            imagesScan.forEach(imageUrl -> {
+                byte[] bytes = fileStorageService.downLoadFile(imageUrl);
+                list.add(bytes);
+            });
+            try {
+                Map imageMap = greenImageScan.imageScan(list);
+                //审核失败
+                if (scanSuggest(news,imageMap)) return;
+
+            } catch (Exception e) {
+                e.printStackTrace();
+            }
+
+            //3.表示审核通过,调用openFeign完成远程调用服务保存相关的article表
+            ArticleDto articleDto = new ArticleDto();
+            BeanUtils.copyProperties(news,articleDto);
+            //设置作者
+            articleDto.setAuthorId(news.getUserId());
+            articleDto.setAuthorName(userService.getById(news.getUserId()).getNickname());
+            //设置频道名称
+            articleDto.setChannelName(channelService.getById(news.getChannelId()).getName());
+            //设置文章布局
+            articleDto.setLayout((int) news.getType());
+            //设置创建时间
+            articleDto.setCreatedTime(new Date());
+            if (news.getArticleId() != null) {
+                articleDto.setId(news.getArticleId());
+            }
+            //通过openFegin远程调用
+
+            ResponseResult responseResult = articleClient.saveArticle(articleDto);
+            if (responseResult.getCode().equals(AppHttpCodeEnum.SUCCESS)) {
+                //如果审核成功：修改news中status=9 会写articleId
+                news.setArticleId((Long) responseResult.getData());
+                news.setStatus(WmNewsStatus.PUBLISHED);
+                //修改
+                this.updateById(news);
+
+
+            }
+
+        }
+
+    }
+
+    //文本和图片审核结果解析
+    private boolean scanSuggest(WmNews news,Map map) {
+        if (map.get("suggestion").equals("block")) {
+            //修改状态 status
+            news.setStatus(WmNewsStatus.AUDIT_FAILURE);
+            //修改审核失败原因 reason
+            news.setReason("审核内容违规");
+            this.updateById(news);
+            return true;
+        }
+
+        if (map.get("suggestion").equals("review")) {
+            //修改状态 status
+            news.setStatus(WmNewsStatus.MANUAL_AUDIT);
+            //修改审核失败原因 reason
+            news.setReason("内容需要进一步人工审核");
+            this.updateById(news);
+            return true;
+        }
+        return false;
+    }
+
+
+}
+
